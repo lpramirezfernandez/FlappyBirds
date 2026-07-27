@@ -7,3 +7,6 @@ services:
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     autoDeploy: true
+    envVars:
+      - key: MONGODB_URI
+        sync: false   # set this in the Render dashboard (contains your DB password)
