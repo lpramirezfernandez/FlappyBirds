@@ -323,17 +323,6 @@ async def stats_get(name: str):
     return base
 
 
-@app.get("/")
-async def root():
-    return JSONResponse({
-        "app": "Flappy Royale server",
-        "status": "running",
-        "websocket": "/ws",
-        "health": "/health",
-        "rooms": len(rooms),
-    })
-
-
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
@@ -410,4 +399,3 @@ async def ws_endpoint(ws: WebSocket):
 # Optionally serve a static web client placed in ./static
 if os.path.isdir(os.path.join(os.path.dirname(__file__), "static")):
     app.mount("/", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static"), html=True), name="static")
-
