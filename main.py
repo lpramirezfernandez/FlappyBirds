@@ -24,14 +24,48 @@ All gameplay values are NORMALIZED: y and gapY are fractions of screen height (0
 pipe x is a fraction of screen width. The web client multiplies by its canvas size, so
 every player sees the identical world regardless of device.
 """
-import asyncio, json, random, string, time
+import asyncio, json, random, string, time, math
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
 from starlette.websockets import WebSocketState
+from fastapi import Body
 import os
 
 app = FastAPI()
+app.add_middleware(CORSMiddleware, allow_origins=["*"],
+                   allow_methods=["*"], allow_headers=["*"])
+
+# ---- MongoDB stats (URI comes from the MONGODB_URI env var — never hardcode the password) ----
+MONGO_URI = os.environ.get("MONGODB_URI", "")
+_mongo = {"client": None, "col": None}
+
+
+def stats_col():
+    if not MONGO_URI:
+        return None
+    if _mongo["col"] is None:
+        from motor.motor_asyncio import AsyncIOMotorClient
+        _mongo["client"] = AsyncIOMotorClient(MONGO_URI)
+        _mongo["col"] = _mongo["client"]["flappyroyale"]["stats"]
+    return _mongo["col"]
+
+
+async def record_result(name, score, win):
+    col = stats_col()
+    if col is None or not name:
+        return
+    try:
+        await col.update_one(
+            {"_id": name.lower()[:20]},
+            {"$set": {"name": name[:20], "lastPlayed": time.time()},
+             "$inc": {"games": 1, "wins": 1 if win else 0, "totalPipes": int(score)},
+             "$max": {"bestScore": int(score)}},
+            upsert=True,
+        )
+    except Exception as e:
+        print("mongo record error:", e)
 
 # ---- physics constants (must match the web client's ratios) ----
 GRAV    = 1.7     # height / s^2
@@ -127,6 +161,8 @@ class Room:
         for p in self.players.values():
             p.y, p.vy, p.alive, p.score, p.rank = 0.42, 0.0, True, 0, 0
         self.pipes = []
+        self.spawn_count = 0
+        self.game_t = 0.0
         self.dead = 0
         self.total = len(self.players)
 
@@ -144,7 +180,8 @@ class Room:
             self.step(dt)
             await self.broadcast({
                 "type": "state",
-                "pipes": [{"x": round(p["x"], 4), "gapY": round(p["gapY"], 4)} for p in self.pipes],
+                "pipes": [{"x": round(p["x"], 4), "gapY": round(p["gapY"], 4),
+                           "gapH": round(p["gapH"], 4)} for p in self.pipes],
                 "birds": [{"id": p.id, "y": round(p.y, 4), "alive": p.alive, "score": p.score}
                           for p in self.players.values()],
             })
@@ -158,17 +195,34 @@ class Room:
         await self.end_game()
 
     def spawn_pipe(self):
-        min_c = GAP / 2 + 0.06
-        max_c = 1 - GROUND - GAP / 2 - 0.04
+        self.spawn_count = getattr(self, "spawn_count", 0) + 1
+        n = self.spawn_count
+        gap = max(0.205, GAP - (GAP - 0.205) * min(1.0, n / 26.0))  # shrinks with progress
+        min_c = gap / 2 + 0.06
+        max_c = 1 - GROUND - gap / 2 - 0.04
         gap_y = random.uniform(min_c, max_c)
         last_x = self.pipes[-1]["x"] if self.pipes else 1.0
-        self.pipes.append({"x": max(1.0, last_x + SPACING), "gapY": gap_y,
-                           "passed": set()})
+        p = {"x": max(1.0, last_x + SPACING), "gapY": gap_y, "baseGapY": gap_y,
+             "gapH": gap, "passed": set(), "amp": 0.0, "osc": 0.0, "phase": 0.0,
+             "minC": min_c, "maxC": max_c}
+        if n >= 7 and random.random() < min(0.65, (n - 7) * 0.07):  # moving pipes later
+            p["amp"] = random.uniform(0.05, 0.11)
+            p["osc"] = random.uniform(1.0, 2.0)
+            p["phase"] = random.uniform(0, 6.28)
+        self.pipes.append(p)
+
+    def lead_score(self):
+        return max((p.score for p in self.players.values()), default=0)
 
     def step(self, dt):
+        self.game_t = getattr(self, "game_t", 0.0) + dt
+        sp = SPEED * (1 + min(0.75, self.lead_score() * 0.03))  # speeds up with progress
         # move + spawn pipes
         for p in self.pipes:
-            p["x"] -= SPEED * dt
+            p["x"] -= sp * dt
+            if p["amp"]:
+                p["gapY"] = min(p["maxC"], max(p["minC"],
+                    p["baseGapY"] + math.sin(self.game_t * p["osc"] + p["phase"]) * p["amp"]))
         while not self.pipes or self.pipes[-1]["x"] < 1 - SPACING:
             self.spawn_pipe()
         self.pipes = [p for p in self.pipes if p["x"] + PIPE_W > -0.05]
@@ -184,9 +238,10 @@ class Room:
             if pl.y + BIRD_RH > ground_y:
                 self.kill(pl); continue
             for p in self.pipes:
+                gh = p["gapH"]
                 within_x = BIRD_X + BIRD_RW > p["x"] and BIRD_X - BIRD_RW < p["x"] + PIPE_W
                 if within_x:
-                    gt, gb = p["gapY"] - GAP / 2, p["gapY"] + GAP / 2
+                    gt, gb = p["gapY"] - gh / 2, p["gapY"] + gh / 2
                     if pl.y - BIRD_RH < gt or pl.y + BIRD_RH > gb:
                         self.kill(pl); break
             if not pl.alive:
@@ -214,6 +269,8 @@ class Room:
                        key=lambda p: (p.rank or 99, -p.score))
         for i, p in enumerate(order):
             p.rank = i + 1
+        for p in order:
+            await record_result(p.name, p.score, p.rank == 1)
         await self.broadcast({
             "type": "gameover",
             "standings": [{"id": p.id, "name": p.name, "color": p.color,
@@ -223,7 +280,58 @@ class Room:
 
 @app.get("/health")
 async def health():
-    return JSONResponse({"ok": True, "rooms": len(rooms)})
+    return JSONResponse({"ok": True, "rooms": len(rooms), "db": bool(MONGO_URI)})
+
+
+@app.post("/stats/record")
+async def stats_record(payload: dict = Body(...)):
+    await record_result(str(payload.get("name", "")),
+                        payload.get("score", 0), bool(payload.get("win")))
+    return {"ok": True}
+
+
+@app.get("/leaderboard")
+async def leaderboard():
+    col = stats_col()
+    if col is None:
+        return {"players": []}
+    out = []
+    try:
+        cur = col.find({}, {"name": 1, "bestScore": 1, "wins": 1, "games": 1}).sort("bestScore", -1).limit(10)
+        async for d in cur:
+            out.append({"name": d.get("name", "?"), "bestScore": d.get("bestScore", 0),
+                        "wins": d.get("wins", 0), "games": d.get("games", 0)})
+    except Exception as e:
+        print("mongo leaderboard error:", e)
+    return {"players": out}
+
+
+@app.get("/stats/{name}")
+async def stats_get(name: str):
+    col = stats_col()
+    base = {"name": name, "games": 0, "wins": 0, "bestScore": 0, "totalPipes": 0}
+    if col is None:
+        return base
+    try:
+        d = await col.find_one({"_id": name.lower()[:20]})
+        if d:
+            return {"name": d.get("name", name), "games": d.get("games", 0),
+                    "wins": d.get("wins", 0), "bestScore": d.get("bestScore", 0),
+                    "totalPipes": d.get("totalPipes", 0)}
+    except Exception as e:
+        print("mongo stats error:", e)
+    return base
+
+
+@app.get("/")
+async def root():
+    return JSONResponse({
+        "app": "Flappy Royale server",
+        "status": "running",
+        "websocket": "/ws",
+        "health": "/health",
+        "rooms": len(rooms),
+    })
 
 
 @app.websocket("/ws")
@@ -302,3 +410,4 @@ async def ws_endpoint(ws: WebSocket):
 # Optionally serve a static web client placed in ./static
 if os.path.isdir(os.path.join(os.path.dirname(__file__), "static")):
     app.mount("/", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static"), html=True), name="static")
+
