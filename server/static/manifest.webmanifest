@@ -1,7 +1,7 @@
 {
-  "name": "Flappy Royale",
-  "short_name": "Flappy Royale",
-  "description": "Multiplayer Flappy Bird battle royale — flap to survive, last bird flying wins.",
+  "name": "Sky Royale",
+  "short_name": "Sky Royale",
+  "description": "Multiplayer sky battle royale — flap to survive, grab shields, last one flying wins.",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",

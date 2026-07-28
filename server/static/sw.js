@@ -1,5 +1,5 @@
 // Flappy Royale service worker — caches the app shell so it opens offline.
-const CACHE = 'flappy-royale-v3';
+const CACHE = 'flappy-royale-v8';
 const ASSETS = ['./', 'index.html', 'manifest.webmanifest',
   'icon-192.png', 'icon-512.png', 'icon-maskable-512.png', 'icon-180.png'];
 
