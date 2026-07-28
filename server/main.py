@@ -110,6 +110,7 @@ class Player:
 class Room:
     def __init__(self, code):
         self.code = code
+        self.mode = "server"
         self.players = {}          # pid -> Player
         self.host_id = None
         self.phase = "lobby"       # lobby | playing | over
@@ -162,6 +163,7 @@ class Room:
             p.y, p.vy, p.alive, p.score, p.rank = 0.42, 0.0, True, 0, 0
         self.pipes = []
         self.spawn_count = 0
+        self.pipe_seq = 0
         self.game_t = 0.0
         self.dead = 0
         self.total = len(self.players)
@@ -173,6 +175,7 @@ class Room:
         await self.broadcast({"type": "start"})
 
         last = time.monotonic()
+        next_t = last
         while self.phase == "playing":
             now = time.monotonic()
             dt = min(0.05, now - last)
@@ -180,7 +183,7 @@ class Room:
             self.step(dt)
             await self.broadcast({
                 "type": "state",
-                "pipes": [{"x": round(p["x"], 4), "gapY": round(p["gapY"], 4),
+                "pipes": [{"id": p["id"], "x": round(p["x"], 4), "gapY": round(p["gapY"], 4),
                            "gapH": round(p["gapH"], 4)} for p in self.pipes],
                 "birds": [{"id": p.id, "y": round(p.y, 4), "alive": p.alive, "score": p.score}
                           for p in self.players.values()],
@@ -190,7 +193,12 @@ class Room:
                 if len(alive) == 1:
                     alive[0].rank = 1
                 break
-            await asyncio.sleep(TICK)
+            next_t += TICK
+            delay = next_t - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            else:
+                next_t = time.monotonic()   # fell behind — resync instead of spiraling
 
         await self.end_game()
 
@@ -202,7 +210,8 @@ class Room:
         max_c = 1 - GROUND - gap / 2 - 0.04
         gap_y = random.uniform(min_c, max_c)
         last_x = self.pipes[-1]["x"] if self.pipes else 1.0
-        p = {"x": max(1.0, last_x + SPACING), "gapY": gap_y, "baseGapY": gap_y,
+        self.pipe_seq = getattr(self, "pipe_seq", 0) + 1
+        p = {"id": self.pipe_seq, "x": max(1.0, last_x + SPACING), "gapY": gap_y, "baseGapY": gap_y,
              "gapH": gap, "passed": set(), "amp": 0.0, "osc": 0.0, "phase": 0.0,
              "minC": min_c, "maxC": max_c}
         if n >= 7 and random.random() < min(0.65, (n - 7) * 0.07):  # moving pipes later
@@ -340,9 +349,10 @@ async def ws_endpoint(ws: WebSocket):
             if t == "create":
                 room = Room(new_code())
                 rooms[room.code] = room
+                room.mode = msg.get("mode", "server")
                 pl = Player(pid, ws, msg.get("name", ""), msg.get("color", ""))
                 room.add(pl)
-                await ws.send_text(json.dumps({"type": "created", "code": room.code, "id": pid}))
+                await ws.send_text(json.dumps({"type": "created", "code": room.code, "id": pid, "mode": room.mode}))
                 await room.broadcast(room.lobby_payload())
 
             elif t == "join":
@@ -358,7 +368,7 @@ async def ws_endpoint(ws: WebSocket):
                     room = r
                     pl = Player(pid, ws, msg.get("name", ""), msg.get("color", ""))
                     room.add(pl)
-                    await ws.send_text(json.dumps({"type": "joined", "code": room.code, "id": pid}))
+                    await ws.send_text(json.dumps({"type": "joined", "code": room.code, "id": pid, "mode": getattr(room, "mode", "server")}))
                     await room.broadcast(room.lobby_payload())
 
             elif t == "ready" and room:
@@ -366,8 +376,25 @@ async def ws_endpoint(ws: WebSocket):
                     room.players[pid].ready = bool(msg.get("ready"))
                     await room.broadcast(room.lobby_payload())
 
+            elif t == "signal" and room:
+                # relay WebRTC offer/answer/ICE between two peers (tiny, connect-time only)
+                target = room.players.get(msg.get("to"))
+                if target:
+                    try:
+                        await target.ws.send_text(json.dumps({
+                            "type": "signal", "from": pid, "data": msg.get("data")}))
+                    except Exception:
+                        pass
+
+            elif t == "p2pstart" and room:
+                # host tells the room a P2P match is starting (guests connect over datachannels)
+                if pid == room.host_id:
+                    await room.broadcast({"type": "p2pstart", "hostId": room.host_id})
+
             elif t == "start" and room:
-                if pid == room.host_id and room.phase in ("lobby", "over"):
+                if getattr(room, "mode", "server") == "p2p":
+                    pass  # P2P rooms run the game on the host device, not here
+                elif pid == room.host_id and room.phase in ("lobby", "over"):
                     everyone_ready = all(p.ready for p in room.players.values())
                     if everyone_ready and len(room.players) >= 1:
                         if room.task:

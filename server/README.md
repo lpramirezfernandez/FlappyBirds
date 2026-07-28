@@ -52,6 +52,13 @@ When this is set, **Create Room / Join Room** use the live server for real
 players. When it is empty, the game runs the built-in offline mode with CPU
 opponents (great for testing and solo play).
 
+## Multiplayer is peer-to-peer (WebRTC)
+Create/Join Room use WebRTC data channels — this server is only a lightweight
+signaling relay + lobby (a few tiny messages at connect time). Once connected,
+the game runs host-authoritative directly between phones, so no game traffic
+touches this server. On the same Wi-Fi that means near-zero latency. A public
+STUN server is used; no TURN, so same-Wi-Fi is the reliable path.
+
 ## Stats in MongoDB
 Set the `MONGODB_URI` env var in Render (never commit the password). The server
 records each match into database `flappyroyale`, collection `stats`, and exposes:
